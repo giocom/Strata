@@ -311,7 +311,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
                                                                                  : (size_t) slot * (size_t) d.cache_blob));
                 } else {
-                    if (fetches < P.staging_cap && fetches < 64) {
+                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = (slot >= 0 && d.cache != nullptr) ? d.cache->device_slot(slot)
                                                                                 : d.src->blob(d.layers, e);
                         if (src != nullptr) {

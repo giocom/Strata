@@ -964,7 +964,7 @@ int main(int argc, char** argv) {
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe)
-    if (o.pcie_frac < 0.0) o.pcie_frac = 1.0;
+    if (o.pcie_frac < 0.0) o.pcie_frac = native_pack ? 0.55 : 0.2;
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
