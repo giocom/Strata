@@ -218,21 +218,162 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 
 bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert,
                              std::string& err) {
+    close();
     if (slot_bytes.empty()) { err = "ExpertCache: no slots"; return false; }
+    if (n_layers <= 0 || n_expert <= 0) {
+        err = "ExpertCache: n_layers and n_expert must be positive";
+        return false;
+    }
+
+    int dev_count = 1;
+    cudaGetDeviceCount(&dev_count);
+    int orig_device = 0;
+    cudaGetDevice(&orig_device);
+
     int64_t mx = 0;
     std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
     for (size_t i = 0; i < slot_bytes.size(); ++i) {
-        // 256-byte aligned slots, so every blob starts where the kernels' vector loads expect it
         off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
-    // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
-    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
+    const uint64_t total_want = off.back();
+
+    if (dev_count > 1) {
+        for (int i = 0; i < dev_count; ++i) {
+            cudaSetDevice(i);
+            for (int j = 0; j < dev_count; ++j) {
+                if (i != j) {
+                    int can_access = 0;
+                    cudaDeviceCanAccessPeer(&can_access, i, j);
+                    if (can_access) {
+                        cudaDeviceEnablePeerAccess(j, 0);
+                        cudaGetLastError();
+                    }
+                }
+            }
+        }
+        cudaSetDevice(orig_device);
+
+        std::vector<size_t> free_bytes(dev_count), total_bytes(dev_count);
+        size_t total_free_all = 0;
+        for (int d = 0; d < dev_count; ++d) {
+            cudaSetDevice(d);
+            cudaMemGetInfo(&free_bytes[d], &total_bytes[d]);
+            total_free_all += free_bytes[d];
+        }
+        cudaSetDevice(orig_device);
+
+        if (total_free_all < total_want) {
+            char buf[320];
+            std::snprintf(buf, sizeof buf,
+                          "ExpertCache: %zu sized slots = %.2f GiB, but only %.2f GiB of total VRAM is free across %d GPUs.",
+                          slot_bytes.size(), (double) total_want / 1073741824.0,
+                          (double) total_free_all / 1073741824.0, dev_count);
+            err = buf;
+            return false;
+        }
+
+        size_t slot_idx = 0;
+        for (int d = 0; d < dev_count && slot_idx < slot_bytes.size(); ++d) {
+            cudaSetDevice(d);
+            size_t fb = free_bytes[d];
+            size_t usable = fb > (512ull << 20) ? fb - (512ull << 20) : 0;
+            size_t seg_start = slot_idx;
+            uint64_t seg_bytes = 0;
+            while (slot_idx < slot_bytes.size()) {
+                uint64_t sz = ((uint64_t) slot_bytes[slot_idx] + 255) / 256 * 256;
+                if (d < dev_count - 1 && seg_bytes + sz > usable && slot_idx > seg_start) {
+                    break;
+                }
+                seg_bytes += sz;
+                ++slot_idx;
+            }
+            int64_t seg_slots = (int64_t) (slot_idx - seg_start);
+            if (seg_slots <= 0) continue;
+
+            void* seg_base = nullptr;
+            if (cudaMalloc(&seg_base, (size_t) seg_bytes) != cudaSuccess) {
+                cudaSetDevice(orig_device);
+                close();
+                err = "ExpertCache: cudaMalloc failed on GPU " + std::to_string(d);
+                return false;
+            }
+            cudaMemset(seg_base, 0, (size_t) seg_bytes);
+
+            CacheSegment seg;
+            seg.base = (uint8_t*) seg_base;
+            seg.ordinal = d;
+            seg.start_slot = (int64_t) seg_start;
+            seg.n_slots = seg_slots;
+            seg.bytes = seg_bytes;
+            segments_.push_back(seg);
+        }
+        cudaSetDevice(orig_device);
+        if (!segments_.empty()) {
+            base_ = segments_[0].base;
+        }
+    } else {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            if ((uint64_t) free_b < total_want) {
+                char buf[320];
+                std::snprintf(buf, sizeof buf,
+                              "ExpertCache: %zu sized slots = %.2f GiB, but only %.2f GiB of VRAM is free.",
+                              slot_bytes.size(), (double) total_want / 1073741824.0, (double) free_b / 1073741824.0);
+                err = buf;
+                return false;
+            }
+        }
+        if (cudaMalloc((void**) &base_, (size_t) total_want) != cudaSuccess) {
+            base_ = nullptr;
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
+                          (double) total_want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
+            err = buf;
+            return false;
+        }
+        if (cudaMemset(base_, 0, (size_t) total_want) != cudaSuccess) {
+            err = "ExpertCache: cudaMemset of the slot arena failed";
+            close();
+            return false;
+        }
+        CacheSegment seg;
+        seg.base = base_;
+        seg.ordinal = 0;
+        seg.start_slot = 0;
+        seg.n_slots = (int64_t) slot_bytes.size();
+        seg.bytes = total_want;
+        segments_.push_back(seg);
+    }
+
+    residency_.assign((size_t) (n_layers * n_expert), kNotResident);
     slots_ = (int64_t) slot_bytes.size();
+    n_layers_ = n_layers;
+    n_expert_ = n_expert;
     blob_ = mx;
+    next_free_ = 0;
+    fills_ = 0;
+    admitted_ = 0;
     off_ = std::move(off);
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    for (int64_t l = 0; l < n_layers; ++l) {
+        int64_t lo = 0, hi = 0;
+        layer_slot_range(l, lo, hi);
+        layer_next_[(size_t) l] = (int32_t) lo;
+    }
     return true;
+}
+
+void ExpertCache::zero_all() {
+    int orig_device = 0;
+    cudaGetDevice(&orig_device);
+    for (const auto& seg : segments_) {
+        if (seg.base != nullptr && seg.bytes > 0) {
+            cudaSetDevice(seg.ordinal);
+            cudaMemset(seg.base, 0, (size_t) seg.bytes);
+        }
+    }
+    cudaSetDevice(orig_device);
 }
 
 void ExpertCache::close() {
@@ -328,6 +469,17 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
+int ExpertCache::slot_device(int32_t slot) const {
+    if (!segments_.empty()) {
+        for (const auto& seg : segments_) {
+            if (slot >= seg.start_slot && slot < seg.start_slot + seg.n_slots) {
+                return seg.ordinal;
+            }
+        }
+    }
+    return 0;
+}
+
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
@@ -340,8 +492,15 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
+    int orig_device = 0;
+    cudaGetDevice(&orig_device);
+    int target_device = slot_device(slot);
+    if (target_device != orig_device) cudaSetDevice(target_device);
+
+    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyDefault,
                                           (cudaStream_t) stream);
+    if (target_device != orig_device) cudaSetDevice(orig_device);
+
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
         return false;
@@ -361,7 +520,14 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
+    int orig_device = 0;
+    cudaGetDevice(&orig_device);
+    int target_device = slot_device(slot);
+    if (target_device != orig_device) cudaSetDevice(target_device);
+
+    const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyDefault);
+    if (target_device != orig_device) cudaSetDevice(orig_device);
+
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
         return false;
@@ -377,11 +543,15 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
         err = "ExpertCache::verify_slot: slot outside the arena";
         return false;
     }
-    // `cudaMemcpy` and not `cudaMemcpyAsync`: this is a startup check, and a check that can be read before it
-    // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
-    // comparison meaningful.
     std::vector<uint8_t> got((size_t) nb);
-    const cudaError_t e = cudaMemcpy(got.data(), src, (size_t) nb, cudaMemcpyDeviceToHost);
+    int orig_device = 0;
+    cudaGetDevice(&orig_device);
+    int target_device = slot_device(slot);
+    if (target_device != orig_device) cudaSetDevice(target_device);
+
+    const cudaError_t e = cudaMemcpy(got.data(), src, (size_t) nb, cudaMemcpyDefault);
+    if (target_device != orig_device) cudaSetDevice(orig_device);
+
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::verify_slot: ") + cudaGetErrorString(e);
         return false;

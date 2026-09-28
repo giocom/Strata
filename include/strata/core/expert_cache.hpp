@@ -113,6 +113,10 @@ public:
     /// The device address of one slot.
     uint8_t* device_slot(int32_t slot);
     const uint8_t* device_slot(int32_t slot) const;
+    int slot_device(int32_t slot) const;
+
+    /// Zeros all allocated memory across all GPU segments safely.
+    void zero_all();
 
     /// Copies `(layer, expert)`'s blob from `host_blob` into `slot` on `stream`.  Asynchronous: the caller
     /// orders it.  Returns false if the indices are out of range rather than reading past the arena.

@@ -1401,18 +1401,25 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (!auto_cache || attempt >= 6) break;
-            cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
+            xcache.zero_all();
             cudaDeviceSynchronize();
-            size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            int dev_count = 1;
+            cudaGetDeviceCount(&dev_count);
+            size_t min_free_b = (size_t) -1;
+            for (int d = 0; d < dev_count; ++d) {
+                cudaSetDevice(d);
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                if (fb < min_free_b) min_free_b = fb;
+            }
+            cudaSetDevice(0);
             const int64_t want = (int64_t) o.vram_reserve_mib << 20;
-            if ((int64_t) free_b >= want - (64ll << 20)) break;
-            // short by (want - free); a figure of 0 only says "at least", so then give back a quarter as well
-            int64_t give = want - (int64_t) free_b + (64ll << 20);
-            if (free_b < ((size_t) 16 << 20)) give = std::max<int64_t>(give, xcache.bytes() / 4);
+            if ((int64_t) min_free_b >= want - (64ll << 20)) break;
+            int64_t give = want - (int64_t) min_free_b + (64ll << 20);
+            if (min_free_b < ((size_t) 16 << 20)) give = std::max<int64_t>(give, xcache.bytes() / 4);
             const int64_t keep_bytes = xcache.bytes() - give;
-            std::fprintf(stderr, "strata generate: only %lld MiB free once the slots are written (reserve %d MiB); "
-                                 "shrinking the expert cache\n", (long long) (free_b >> 20), o.vram_reserve_mib);
+            std::fprintf(stderr, "strata generate: only %lld MiB free on a GPU once the slots are written (reserve %d MiB); "
+                                 "shrinking the expert cache\n", (long long) (min_free_b >> 20), o.vram_reserve_mib);
             xcache.close();
             if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); break; }
             if (!sized_slots.empty()) {
