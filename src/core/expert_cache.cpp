@@ -81,6 +81,8 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
+    const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
+
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
         if ((uint64_t) free_b < want) {
