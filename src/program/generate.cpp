@@ -2092,7 +2092,7 @@ int main(int argc, char** argv) {
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const int32_t slot = xcache.slot_of(l, e);
-                if (slot != strata::core::kNotResident && xcache.slot_device(slot) == 0) {
+                if (slot != strata::core::kNotResident) {
                     host_res[(size_t) (l * g.n_expert + e)] = slot;
                     ++resident;
                 }
@@ -2115,7 +2115,7 @@ int main(int argc, char** argv) {
         thits.scratch = drive.d.hit_scratch;
         thits.hit_out = drive.d.hit_out;
         drive.d.host_res = host_res.data();
-        std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts on GPU 0, decided on the device\n",
+        std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts across GPUs, decided on the device\n",
                      (long long) resident);
     }
     if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&

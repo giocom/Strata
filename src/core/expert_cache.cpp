@@ -148,6 +148,19 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         segments_.push_back(seg);
         current_slot += s_count;
     }
+    for (int i = 0; i < dev_count; ++i) {
+        cudaSetDevice(i);
+        for (int j = 0; j < dev_count; ++j) {
+            if (i != j) {
+                int can_access = 0;
+                cudaDeviceCanAccessPeer(&can_access, i, j);
+                if (can_access) {
+                    cudaDeviceEnablePeerAccess(j, 0);
+                    cudaGetLastError();
+                }
+            }
+        }
+    }
     cudaSetDevice(orig_device);
 
     if (segments_.empty()) {
@@ -255,6 +268,19 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         seg.n_slots = (int64_t) (current_slot - start_s);
         seg.bytes = seg_bytes;
         segments_.push_back(seg);
+    }
+    for (int i = 0; i < dev_count; ++i) {
+        cudaSetDevice(i);
+        for (int j = 0; j < dev_count; ++j) {
+            if (i != j) {
+                int can_access = 0;
+                cudaDeviceCanAccessPeer(&can_access, i, j);
+                if (can_access) {
+                    cudaDeviceEnablePeerAccess(j, 0);
+                    cudaGetLastError();
+                }
+            }
+        }
     }
     cudaSetDevice(orig_device);
 
