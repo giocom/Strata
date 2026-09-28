@@ -81,43 +81,122 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
+    int dev_count = 1;
+    cudaGetDeviceCount(&dev_count);
+    int orig_device = 0;
+    cudaGetDevice(&orig_device);
+
     const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
 
-    // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**
-    //
-    // `cudaMalloc` failing is the easy case. The one that matters is a machine where the weights already own
-    // most of VRAM: the cache then takes what is left and `slots()` would report the number ASKED FOR while
-    // `device_slot()` walks off the end. So the free-VRAM figure is read and compared BEFORE the allocation,
-    // and the two numbers are named in the refusal.
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-        if ((uint64_t) free_b < want) {
+    if (dev_count > 1) {
+        // Enable P2P access among all devices
+        for (int i = 0; i < dev_count; ++i) {
+            cudaSetDevice(i);
+            for (int j = 0; j < dev_count; ++j) {
+                if (i != j) {
+                    int can_access = 0;
+                    cudaDeviceCanAccessPeer(&can_access, i, j);
+                    if (can_access) {
+                        cudaDeviceEnablePeerAccess(j, 0);
+                        cudaGetLastError(); // clear status if already enabled
+                    }
+                }
+            }
+        }
+        cudaSetDevice(orig_device);
+
+        std::vector<size_t> free_bytes(dev_count), total_bytes(dev_count);
+        size_t total_free_all = 0;
+        for (int d = 0; d < dev_count; ++d) {
+            cudaSetDevice(d);
+            cudaMemGetInfo(&free_bytes[d], &total_bytes[d]);
+            total_free_all += free_bytes[d];
+        }
+        cudaSetDevice(orig_device);
+
+        if (total_free_all < want) {
             char buf[320];
             std::snprintf(buf, sizeof buf,
-                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
-                          "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
+                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of total VRAM is free across %d GPUs.",
                           (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
-                          (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
-                          (double) total_b / 1073741824.0);
+                          (double) total_free_all / 1073741824.0, dev_count);
             err = buf;
             return false;
         }
-    }
 
-    if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
-        base_ = nullptr;
-        char buf[256];
-        std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
-                      (double) want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
-        err = buf;
-        return false;
-    }
-    // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
-    // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
-    if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
-        err = "ExpertCache: cudaMemset of the slot arena failed";
-        close();
-        return false;
+        int64_t remaining_slots = n_slots;
+        int64_t current_start = 0;
+        for (int d = 0; d < dev_count && remaining_slots > 0; ++d) {
+            cudaSetDevice(d);
+            size_t fb = free_bytes[d];
+            size_t usable = fb > (512ull << 20) ? fb - (512ull << 20) : 0;
+            int64_t seg_slots = std::min<int64_t>(remaining_slots, (int64_t)(usable / (uint64_t) blob_bytes));
+            if (d == dev_count - 1 && seg_slots < remaining_slots) {
+                seg_slots = remaining_slots;
+            }
+            if (seg_slots <= 0) continue;
+
+            uint64_t seg_bytes = (uint64_t) seg_slots * (uint64_t) blob_bytes;
+            void* seg_base = nullptr;
+            if (cudaMalloc(&seg_base, (size_t) seg_bytes) != cudaSuccess) {
+                cudaSetDevice(orig_device);
+                close();
+                err = "ExpertCache: cudaMalloc failed on GPU " + std::to_string(d);
+                return false;
+            }
+            cudaMemset(seg_base, 0, (size_t) seg_bytes);
+
+            CacheSegment seg;
+            seg.base = (uint8_t*) seg_base;
+            seg.ordinal = d;
+            seg.start_slot = current_start;
+            seg.n_slots = seg_slots;
+            seg.bytes = seg_bytes;
+            segments_.push_back(seg);
+
+            current_start += seg_slots;
+            remaining_slots -= seg_slots;
+        }
+        cudaSetDevice(orig_device);
+        if (!segments_.empty()) {
+            base_ = segments_[0].base;
+        }
+    } else {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            if ((uint64_t) free_b < want) {
+                char buf[320];
+                std::snprintf(buf, sizeof buf,
+                              "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
+                              "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
+                              (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
+                              (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
+                              (double) total_b / 1073741824.0);
+                err = buf;
+                return false;
+            }
+        }
+
+        if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
+            base_ = nullptr;
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
+                          (double) want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
+            err = buf;
+            return false;
+        }
+        if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
+            err = "ExpertCache: cudaMemset of the slot arena failed";
+            close();
+            return false;
+        }
+        CacheSegment seg;
+        seg.base = base_;
+        seg.ordinal = 0;
+        seg.start_slot = 0;
+        seg.n_slots = n_slots;
+        seg.bytes = want;
+        segments_.push_back(seg);
     }
 
     residency_.assign((size_t) (n_layers * n_expert), kNotResident);
@@ -128,8 +207,6 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     next_free_ = 0;
     fills_ = 0;
     admitted_ = 0;
-    // R4.2g: each layer starts at the bottom of its own range.  Built here rather than lazily so `admit`
-    // stays allocation-free on the token path.
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
     for (int64_t l = 0; l < n_layers; ++l) {
         int64_t lo = 0, hi = 0;
@@ -160,10 +237,18 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 
 void ExpertCache::close() {
     off_.clear();
-    if (base_ != nullptr) {
-        cudaFree(base_);
-        base_ = nullptr;
+    int orig_device = 0;
+    cudaGetDevice(&orig_device);
+    for (auto& seg : segments_) {
+        if (seg.base != nullptr) {
+            cudaSetDevice(seg.ordinal);
+            cudaFree(seg.base);
+            seg.base = nullptr;
+        }
     }
+    cudaSetDevice(orig_device);
+    segments_.clear();
+    base_ = nullptr;
     residency_.clear();
     slots_ = 0;
     n_layers_ = 0;
@@ -195,30 +280,50 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     const size_t at = (size_t) (layer * n_expert_ + expert);
     if (residency_[at] != kNotResident) return residency_[at];
-    // R4.2g: THE PER-LAYER PATH.  Same "no eviction" rule, but the ceiling is this layer's own range rather
-    // than one counter shared by all 48 - which is what confined the measured hit rate to 2.97%.
     if (per_layer_) {
         if (layer_next_.empty()) return kNotResident;
         int64_t lo = 0, hi = 0;
         layer_slot_range(layer, lo, hi);
-        if ((int64_t) layer_next_[(size_t) layer] >= hi) return kNotResident;   // this layer's quota is full
+        if ((int64_t) layer_next_[(size_t) layer] >= hi) return kNotResident;
         residency_[at] = layer_next_[(size_t) layer]++;
         ++admitted_;
         return residency_[at];
     }
-    if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
+    if (next_free_ >= slots_) return kNotResident;
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
     if (slot < 0 || slot >= slots_) return nullptr;
+    if (!segments_.empty()) {
+        for (const auto& seg : segments_) {
+            if (slot >= seg.start_slot && slot < seg.start_slot + seg.n_slots) {
+                if (!off_.empty()) {
+                    uint64_t local_off = off_[(size_t) slot] - off_[(size_t) seg.start_slot];
+                    return seg.base + local_off;
+                }
+                return seg.base + (size_t) (slot - seg.start_slot) * (size_t) blob_;
+            }
+        }
+    }
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     if (slot < 0 || slot >= slots_) return nullptr;
+    if (!segments_.empty()) {
+        for (const auto& seg : segments_) {
+            if (slot >= seg.start_slot && slot < seg.start_slot + seg.n_slots) {
+                if (!off_.empty()) {
+                    uint64_t local_off = off_[(size_t) slot] - off_[(size_t) seg.start_slot];
+                    return seg.base + local_off;
+                }
+                return seg.base + (size_t) (slot - seg.start_slot) * (size_t) blob_;
+            }
+        }
+    }
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }

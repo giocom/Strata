@@ -135,8 +135,16 @@ public:
     /// Slots filled so far, for the startup report.
     int64_t fills() const { return fills_; }
 
-private:
+    struct CacheSegment {
+        uint8_t* base = nullptr;
+        int ordinal = 0;
+        int64_t start_slot = 0;
+        int64_t n_slots = 0;
+        uint64_t bytes = 0;
+    };
+
     uint8_t* base_ = nullptr;
+    std::vector<CacheSegment> segments_;
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
     int64_t n_layers_ = 0;
