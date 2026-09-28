@@ -2092,8 +2092,10 @@ int main(int argc, char** argv) {
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
                 const int32_t slot = xcache.slot_of(l, e);
-                host_res[(size_t) (l * g.n_expert + e)] = slot;
-                if (slot != strata::core::kNotResident) ++resident;
+                if (slot != strata::core::kNotResident && xcache.slot_device(slot) == 0) {
+                    host_res[(size_t) (l * g.n_expert + e)] = slot;
+                    ++resident;
+                }
             }
         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
@@ -2113,7 +2115,7 @@ int main(int argc, char** argv) {
         thits.scratch = drive.d.hit_scratch;
         thits.hit_out = drive.d.hit_out;
         drive.d.host_res = host_res.data();
-        std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts, decided on the device\n",
+        std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts on GPU 0, decided on the device\n",
                      (long long) resident);
     }
     if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&
@@ -2169,24 +2171,22 @@ int main(int argc, char** argv) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;
-        // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card the
-        // cache already filled to its reserve, that is the over-subscription the auto sizing avoids - so the
-        // prompt chunk is halved until its buffers fit in the lendable slots (a smaller chunk only reads slower)
+        const int64_t gpu0_slots = !xcache.segments().empty() ? xcache.segments()[0].n_slots : xcache.slots();
         for (int64_t chunk = o.prefill_chunk; !o.no_prefill_borrow && d_res != nullptr && chunk >= 256; chunk /= 2) {
             const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, chunk);
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
             if (xcache.slot_offsets() != nullptr) {
                 k = 0;
-                while (k < xcache.slots() &&
-                       (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+                while (k < gpu0_slots &&
+                       (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[gpu0_slots - k]) < need) ++k;
             }
-            if (k + 128 <= xcache.slots()) {
+            if (k + 128 <= gpu0_slots) {
                 if (chunk != o.prefill_chunk)
                     std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in the "
                                          "expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
-                lend_first = (int32_t) (xcache.slots() - k);
+                lend_first = (int32_t) (gpu0_slots - k);
                 borrow = xcache.device_slot(lend_first);
                 borrow_bytes = xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[lend_first])
                                                      : (uint64_t) k * (uint64_t) blob;
@@ -2195,7 +2195,7 @@ int main(int argc, char** argv) {
         }
         if (borrow != nullptr)
             std::fprintf(stderr, "strata serve: the prompt path borrows %lld cache slots (%.2f GiB)\n",
-                         (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
+                         (long long) (gpu0_slots - lend_first), (double) borrow_bytes / 1073741824.0);
         else
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
@@ -3048,17 +3048,18 @@ int main(int argc, char** argv) {
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
+        const int64_t gpu0_slots = !xcache.segments().empty() ? xcache.segments()[0].n_slots : xcache.slots();
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
             const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk);
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
-            if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
+            if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end of GPU 0 until they hold `need`
                 k = 0;
-                while (k < xcache.slots() &&
-                       (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+                while (k < gpu0_slots &&
+                       (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[gpu0_slots - k]) < need) ++k;
             }
-            if (k + 128 <= xcache.slots()) {   // the lent slots are refilled after the prompt
-                const int32_t first = (int32_t) (xcache.slots() - k);
+            if (k + 128 <= gpu0_slots) {   // the lent slots are refilled after the prompt
+                const int32_t first = (int32_t) (gpu0_slots - k);
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent.emplace_back((int32_t) i, host_res[i]);
