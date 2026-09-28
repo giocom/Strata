@@ -1330,31 +1330,46 @@ int main(int argc, char** argv) {
     }
     const bool auto_cache = o.expert_cache < 0;
     if (o.expert_cache < 0) {
-        size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
-        // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
-        // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
-        // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
-        const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
-        int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        int dev_count = 1;
+        cudaGetDeviceCount(&dev_count);
+        size_t total_free_b = 0;
+        for (int d = 0; d < dev_count; ++d) {
+            cudaSetDevice(d);
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            const int64_t borrow = (!o.no_prefill_borrow && !o.expert_profile.empty()) ? 0 : 1;
+            const int64_t prefill_mib = (d == 0 && o.prefill_chunk > 0 && borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+            const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
+            if ((int64_t) fb > reserve) total_free_b += (fb - reserve);
+        }
+        cudaSetDevice(0);
+
+        int64_t slots = (int64_t) total_free_b / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
+        std::fprintf(stderr, "strata generate: expert cache auto across %d GPUs: %.2f GiB available -> %d slots\n",
+                     dev_count, (double) total_free_b / 1073741824.0, o.expert_cache);
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
     std::vector<int64_t> sized_slots;
     if (native_pack && o.expert_cache > 0 && !profile.empty()) {
-        size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        int dev_count = 1;
+        cudaGetDeviceCount(&dev_count);
+        size_t total_free_room = 0;
+        for (int d = 0; d < dev_count; ++d) {
+            cudaSetDevice(d);
+            size_t fb = 0, tb = 0;
+            cudaMemGetInfo(&fb, &tb);
+            const size_t reserve = (size_t) o.vram_reserve_mib << 20;
+            if (fb > reserve) total_free_room += (fb - reserve);
+        }
+        cudaSetDevice(0);
+
         const auto& lay = strata::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
-        size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
-        const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
+        const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) total_free_room);
         for (const auto& pr : profile) {
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > cap) break;
@@ -1413,8 +1428,8 @@ int main(int argc, char** argv) {
         }
     }
     if (o.expert_cache > 0) {
-        std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
-                     (long long) xcache.slots(), xcache.gib());
+        std::fprintf(stderr, "strata generate: expert cache %lld slots across %zu segment(s), %.2f GiB of VRAM; policy is\n",
+                     (long long) xcache.slots(), xcache.segments().size(), xcache.gib());
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -1424,9 +1439,9 @@ int main(int argc, char** argv) {
         // forced on 2,557 tokens (bench/results/2026-09-27-cache-parity): 95-98% same top-1, and perplexity equal
         // (on - off = -0.005 +- 0.005 nats). Neither output is more correct than the other.
         std::fprintf(stderr,
-                     "strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
-                     "                 so a reply can differ slightly from a run without the cache (same quality:\n"
-                     "                 bench/results/2026-09-27-cache-parity).\n");
+             "strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
+             "                 so a reply can differ slightly from a run without the cache (same quality:\n"
+             "                 bench/results/2026-09-27-cache-parity).\n");
         if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);
@@ -1524,6 +1539,47 @@ int main(int argc, char** argv) {
         drive.d.hit_done = (void*) hit_done;
         drive.d.hit_poke = !o.no_hit_poke;
         drive.d.h_dst.resize((size_t) K);
+
+        // Multi-GPU helper state for GPU 1 if secondary segment exists
+        if (xcache.segments().size() > 1) {
+            cudaSetDevice(1);
+            cudaStream_t s1 = nullptr;
+            cudaEvent_t e1 = nullptr;
+            cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking);
+            cudaEventCreateWithFlags(&e1, cudaEventDisableTiming);
+
+            const uint64_t sb1 = strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF);
+            void* hit_scratch1 = nullptr;
+            int32_t* d_slot1 = nullptr;
+            int32_t* d_dst1 = nullptr;
+            uint8_t* d_q8_1 = nullptr;
+            float* d_scale1 = nullptr;
+            float* d_out1 = nullptr;
+
+            if (cudaMalloc(&hit_scratch1, (size_t) sb1) == cudaSuccess &&
+                cudaMalloc((void**) &d_slot1, (size_t) K * sizeof(int32_t)) == cudaSuccess &&
+                cudaMalloc((void**) &d_dst1, (size_t) K * sizeof(int32_t)) == cudaSuccess &&
+                cudaMalloc((void**) &d_q8_1, (size_t) (g.n_embd / 32) * 34) == cudaSuccess &&
+                cudaMalloc((void**) &d_scale1, (size_t) (g.n_embd / 32) * sizeof(float)) == cudaSuccess &&
+                cudaMalloc((void**) &d_out1, (size_t) K * g.n_embd * sizeof(float)) == cudaSuccess) {
+                drive.d.dev1.ordinal = 1;
+                drive.d.dev1.stream = (void*) s1;
+                drive.d.dev1.event = (void*) e1;
+                drive.d.dev1.hit_scratch = hit_scratch1;
+                drive.d.dev1.d_slot = d_slot1;
+                drive.d.dev1.d_dst = d_dst1;
+                drive.d.dev1.x_q8_0 = d_q8_1;
+                drive.d.dev1.x_q8_0_scale = d_scale1;
+                drive.d.dev1.hit_out = d_out1;
+                drive.d.dev1.h_slot.resize((size_t) K);
+                drive.d.dev1.h_dst.resize((size_t) K);
+                drive.d.dev1.ready = true;
+                std::fprintf(stderr, "strata generate: multi-GPU hit path ON for GPU 1 (%.2f GiB allocated)\n",
+                             (double) xcache.segments()[1].bytes / 1073741824.0);
+            }
+            cudaSetDevice(0);
+        }
+
         mem_mark("the R4 hit path");
         std::fprintf(stderr, "strata generate: R4 hit path ON - resident experts are computed on the GPU\n");
     }

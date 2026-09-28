@@ -148,6 +148,21 @@ struct ExpertDispatch {
     int32_t* d_slot = nullptr;             ///< device, K entries
     int32_t* d_dst = nullptr;              ///< device, K entries
     std::vector<int32_t> h_slot, h_dst;    ///< host staging, sized at session setup
+
+    struct DeviceHitState {
+        int ordinal = 1;
+        void* stream = nullptr;
+        void* event = nullptr;
+        void* hit_scratch = nullptr;
+        int32_t* d_slot = nullptr;
+        int32_t* d_dst = nullptr;
+        uint8_t* x_q8_0 = nullptr;
+        float* x_q8_0_scale = nullptr;
+        float* hit_out = nullptr;
+        std::vector<int32_t> h_slot, h_dst;
+        bool ready = false;
+    } dev1;
+
     /// **PER ROUTER INDEX, DECIDED IN `Launch` AND CONSUMED BY THE POOL.**  The two callbacks share it
     /// so the decision is made exactly once, on this layer's ids, and neither side can re-decide it.
     std::vector<uint8_t> is_hit;

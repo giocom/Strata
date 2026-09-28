@@ -489,27 +489,34 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         d.decided = true;
         if (d.n_hits <= 0) return;   // nothing resident yet: no GPU work, and nothing for `Combine` to add
 
-        const size_t list_bytes = (size_t) d.n_hits * sizeof(int32_t);
-        // `hit_out` is ZEROED rather than overwritten: the kernel writes only the rows this layer's hits own,
-        // so a row that was a hit last layer and a miss this one would still hold last layer's expert and
-        // `add_inplace` would sum it in.  Finite, plausible, wrong.
-        if (cudaMemsetAsync(d.hit_out, 0, (size_t) d.parts_elems * sizeof(float), cs) != cudaSuccess ||
-            cudaMemcpyAsync(d.d_slot, d.h_slot.data(), list_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
-            cudaMemcpyAsync(d.d_dst, d.h_dst.data(), list_bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+        const auto& segs = d.cache->segments();
+        int n_hits_dev0 = 0, n_hits_dev1 = 0;
+        std::vector<int32_t> h_slot_dev0((size_t) d.n_hits), h_dst_dev0((size_t) d.n_hits);
+        std::vector<int32_t> h_slot_dev1((size_t) d.n_hits), h_dst_dev1((size_t) d.n_hits);
+
+        for (int64_t i = 0; i < d.n_hits; ++i) {
+            const int32_t slot = d.h_slot[(size_t) i];
+            const int32_t dst = d.h_dst[(size_t) i];
+            const int dev = d.cache->slot_device(slot);
+            if (dev == 1 && d.dev1.ready && segs.size() > 1) {
+                h_slot_dev1[(size_t) n_hits_dev1] = slot - (int32_t) segs[1].start_slot;
+                h_dst_dev1[(size_t) n_hits_dev1] = dst;
+                ++n_hits_dev1;
+            } else {
+                h_slot_dev0[(size_t) n_hits_dev0] = slot;
+                h_dst_dev0[(size_t) n_hits_dev0] = dst;
+                ++n_hits_dev0;
+            }
+        }
+
+        // `hit_out` is ZEROED rather than overwritten: the kernel writes only the rows this layer's hits own
+        if (cudaMemsetAsync(d.hit_out, 0, (size_t) d.parts_elems * sizeof(float), cs) != cudaSuccess) {
             d.hit_fail = "the hit list could not be staged";
             d.failed = true;
             d.fail = d.hit_fail;
             return;
         }
-        // The activation is quantized HERE rather than reused from `s.moe.x_q8_0`, which `post[l-1]` wrote from
-        // the PREVIOUS layer's `mixed`.  `pre[l]` has since overwritten `mixed`, so that buffer is a layer stale
-        // - and a stale activation produces a perfectly finite expert for the wrong input.
-        // **R4.2h: THE SCALED QUANTIZER, SO A HIT REPRODUCES A MISS.**  The CPU pool quantizes this same
-        // activation with `act_quant_q8_1` and multiplies by the fp32 `ActQ::scale`; `quantize_q8_0` writes
-        // an fp16 `d` instead, and `bench/micro/act_quant_parity.cu` measured **80 of 80 chunks differing by
-        // up to 4.761e-04 relative**.  `quantize_q8_0_scaled` adopts the CPU's rule and scale, and the kernel
-        // takes the fp32 array.  Falling back to the old path would silently reintroduce the divergence, so
-        // the scales are required here rather than optional.
+
         if (d.x_q8_0_hit_scale == nullptr) {
             d.failed = true;
             d.fail = "the hit path has no fp32 activation scales (R4.2h)";
@@ -517,16 +524,53 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         }
         strata::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, strata::kernels::cpu::H,
                                               cs);
-        if (d.hit_cpu_order)
-            strata::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
-                d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
-        else
-            strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
-                d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
+
+        // 1. GPU 0 Hits
+        if (n_hits_dev0 > 0) {
+            const size_t list_bytes0 = (size_t) n_hits_dev0 * sizeof(int32_t);
+            cudaMemcpyAsync(d.d_slot, h_slot_dev0.data(), list_bytes0, cudaMemcpyHostToDevice, cs);
+            cudaMemcpyAsync(d.d_dst, h_dst_dev0.data(), list_bytes0, cudaMemcpyHostToDevice, cs);
+            if (d.hit_cpu_order)
+                strata::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, n_hits_dev0,
+                    d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
+            else
+                strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, n_hits_dev0, d.cache_blob,
+                    d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
+        }
+
+        // 2. GPU 1 Hits
+        if (n_hits_dev1 > 0 && d.dev1.ready) {
+            cudaStream_t cs1 = (cudaStream_t) d.dev1.stream;
+            const size_t q8_bytes = (size_t) (strata::kernels::cpu::H / 32) * 34;
+            const size_t scale_bytes = (size_t) (strata::kernels::cpu::H / 32) * sizeof(float);
+            const size_t list_bytes1 = (size_t) n_hits_dev1 * sizeof(int32_t);
+
+            cudaMemcpyAsync(d.dev1.x_q8_0, d.x_q8_0_hit, q8_bytes, cudaMemcpyDeviceToDevice, cs1);
+            cudaMemcpyAsync(d.dev1.x_q8_0_scale, d.x_q8_0_hit_scale, scale_bytes, cudaMemcpyDeviceToDevice, cs1);
+            cudaMemcpyAsync(d.dev1.d_slot, h_slot_dev1.data(), list_bytes1, cudaMemcpyHostToDevice, cs1);
+            cudaMemcpyAsync(d.dev1.d_dst, h_dst_dev1.data(), list_bytes1, cudaMemcpyHostToDevice, cs1);
+            cudaMemsetAsync(d.dev1.hit_out, 0, (size_t) d.parts_elems * sizeof(float), cs1);
+
+            if (d.hit_cpu_order)
+                strata::kernels::moe_hit_grouped_s2_cpu_order(segs[1].base, d.dev1.d_slot, d.dev1.d_dst, n_hits_dev1,
+                    d.cache_blob, d.dev1.x_q8_0, d.dev1.hit_scratch, d.dev1.hit_out, cs1, d.dev1.x_q8_0_scale);
+            else
+                strata::kernels::moe_hit_grouped_s2(segs[1].base, d.dev1.d_slot, d.dev1.d_dst, n_hits_dev1,
+                    d.cache_blob, d.dev1.x_q8_0, d.dev1.hit_scratch, d.dev1.hit_out, cs1, d.dev1.x_q8_0_scale);
+
+            for (int h = 0; h < n_hits_dev1; ++h) {
+                const int dst_idx = h_dst_dev1[(size_t) h];
+                float* dst_ptr = d.hit_out + (size_t) dst_idx * strata::kernels::cpu::H;
+                const float* src_ptr = d.dev1.hit_out + (size_t) dst_idx * strata::kernels::cpu::H;
+                cudaMemcpyAsync(dst_ptr, src_ptr, (size_t) strata::kernels::cpu::H * sizeof(float),
+                                cudaMemcpyDeviceToDevice, cs1);
+            }
+            cudaEventRecord((cudaEvent_t) d.dev1.event, cs1);
+            cudaStreamWaitEvent(cs, (cudaEvent_t) d.dev1.event, 0);
+        }
+
         d.hit_pending = true;
         if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
-        // The A/B arm: ONE driver entry here, and nothing else changes.  If the work was waiting for the host
-        // to enter the driver, this is what lets it start while the pool runs.
         if (d.hit_poke && d.hit_done != nullptr) (void) cudaEventQuery((cudaEvent_t) d.hit_done);
         return;
     }
@@ -534,9 +578,9 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
     // Combine: `parts += hit_out`, stream-ordered after the misses were copied into `parts`.
     if (!d.hit_pending) return;
     d.hit_pending = false;
-    // Did the GPU get the hit work done while the CPU was in the pool?  This query is itself a driver entry,
-    // so it is the LAST chance to observe a late start: a NOT-READY here means the work had not finished by the
-    // time the pool returned, and with no poke in front of it that can only be because it began after.
+    if (d.dev1.ready && d.dev1.event != nullptr) {
+        cudaStreamWaitEvent(cs, (cudaEvent_t) d.dev1.event, 0);
+    }
     if (d.hit_done != nullptr) {
         if (cudaEventQuery((cudaEvent_t) d.hit_done) == cudaSuccess) ++d.hit_ready;
         else ++d.hit_late;

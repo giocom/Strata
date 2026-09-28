@@ -147,6 +147,8 @@ public:
         uint64_t bytes = 0;
     };
 
+    const std::vector<CacheSegment>& segments() const { return segments_; }
+
     uint8_t* base_ = nullptr;
     std::vector<CacheSegment> segments_;
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident

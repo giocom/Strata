@@ -81,43 +81,80 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
-    const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
+    int dev_count = 1;
+    cudaGetDeviceCount(&dev_count);
+    int orig_device = 0;
+    cudaGetDevice(&orig_device);
 
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-        if ((uint64_t) free_b < want) {
-            char buf[320];
-            std::snprintf(buf, sizeof buf,
-                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
-                          "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
-                          (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
-                          (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
-                          (double) total_b / 1073741824.0);
-            err = buf;
-            return false;
-        }
+    const uint64_t total_want = (uint64_t) n_slots * (uint64_t) blob_bytes;
+
+    std::vector<size_t> dev_free(dev_count, 0);
+    uint64_t total_free_b = 0;
+    for (int d = 0; d < dev_count; ++d) {
+        cudaSetDevice(d);
+        size_t fb = 0, tb = 0;
+        cudaMemGetInfo(&fb, &tb);
+        const size_t reserve = 512ull << 20;
+        dev_free[d] = fb > reserve ? fb - reserve : 0;
+        total_free_b += dev_free[d];
     }
+    cudaSetDevice(orig_device);
 
-    if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
-        base_ = nullptr;
-        char buf[256];
-        std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
-                      (double) want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
+    if (total_free_b < total_want) {
+        char buf[320];
+        std::snprintf(buf, sizeof buf,
+                      "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free across %d GPUs.",
+                      (long long) n_slots, (long long) blob_bytes, (double) total_want / 1073741824.0,
+                      (double) total_free_b / 1073741824.0, dev_count);
         err = buf;
         return false;
     }
-    if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
-        err = "ExpertCache: cudaMemset of the slot arena failed";
-        close();
+
+    int64_t current_slot = 0;
+    for (int d = 0; d < dev_count && current_slot < n_slots; ++d) {
+        const int64_t start_s = current_slot;
+        const int64_t max_d_slots = (int64_t) (dev_free[d] / (size_t) blob_bytes);
+        int64_t s_count = n_slots - current_slot;
+        if (d + 1 < dev_count && s_count > max_d_slots) {
+            s_count = max_d_slots;
+        }
+        if (s_count <= 0) continue;
+        const uint64_t seg_bytes = (uint64_t) s_count * (uint64_t) blob_bytes;
+
+        cudaSetDevice(d);
+        uint8_t* p = nullptr;
+        if (cudaMalloc((void**) &p, (size_t) seg_bytes) != cudaSuccess) {
+            cudaSetDevice(orig_device);
+            close();
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) on GPU %d failed: %s",
+                          (double) seg_bytes / 1073741824.0, d, cudaGetErrorString(cudaGetLastError()));
+            err = buf;
+            return false;
+        }
+        if (cudaMemset(p, 0, (size_t) seg_bytes) != cudaSuccess) {
+            cudaSetDevice(orig_device);
+            close();
+            err = "ExpertCache: cudaMemset failed on GPU " + std::to_string(d);
+            return false;
+        }
+
+        CacheSegment seg;
+        seg.base = p;
+        seg.ordinal = d;
+        seg.start_slot = start_s;
+        seg.n_slots = s_count;
+        seg.bytes = seg_bytes;
+        segments_.push_back(seg);
+        current_slot += s_count;
+    }
+    cudaSetDevice(orig_device);
+
+    if (segments_.empty()) {
+        err = "ExpertCache: no segments allocated";
         return false;
     }
-    CacheSegment seg;
-    seg.base = base_;
-    seg.ordinal = 0;
-    seg.start_slot = 0;
-    seg.n_slots = n_slots;
-    seg.bytes = want;
-    segments_.push_back(seg);
+    base_ = segments_[0].base;
 
     residency_.assign((size_t) (n_layers * n_expert), kNotResident);
     slots_ = n_slots;
@@ -158,37 +195,74 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     }
     const uint64_t total_want = off.back();
 
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-        if ((uint64_t) free_b < total_want) {
-            char buf[320];
-            std::snprintf(buf, sizeof buf,
-                          "ExpertCache: %zu sized slots = %.2f GiB, but only %.2f GiB of VRAM is free.",
-                          slot_bytes.size(), (double) total_want / 1073741824.0, (double) free_b / 1073741824.0);
-            err = buf;
-            return false;
-        }
+    std::vector<size_t> dev_free(dev_count, 0);
+    uint64_t total_free_b = 0;
+    for (int d = 0; d < dev_count; ++d) {
+        cudaSetDevice(d);
+        size_t fb = 0, tb = 0;
+        cudaMemGetInfo(&fb, &tb);
+        const size_t reserve = 512ull << 20;
+        dev_free[d] = fb > reserve ? fb - reserve : 0;
+        total_free_b += dev_free[d];
     }
-    if (cudaMalloc((void**) &base_, (size_t) total_want) != cudaSuccess) {
-        base_ = nullptr;
-        char buf[256];
-        std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
-                      (double) total_want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
+    cudaSetDevice(orig_device);
+
+    if (total_free_b < total_want) {
+        char buf[320];
+        std::snprintf(buf, sizeof buf,
+                      "ExpertCache: %zu sized slots = %.2f GiB, but only %.2f GiB of VRAM is free across %d GPUs.",
+                      slot_bytes.size(), (double) total_want / 1073741824.0, (double) total_free_b / 1073741824.0, dev_count);
         err = buf;
         return false;
     }
-    if (cudaMemset(base_, 0, (size_t) total_want) != cudaSuccess) {
-        err = "ExpertCache: cudaMemset of the slot arena failed";
-        close();
+
+    size_t current_slot = 0;
+    for (int d = 0; d < dev_count && current_slot < slot_bytes.size(); ++d) {
+        const size_t start_s = current_slot;
+        uint64_t seg_bytes = 0;
+        while (current_slot < slot_bytes.size()) {
+            const uint64_t b = ((uint64_t) slot_bytes[current_slot] + 255) / 256 * 256;
+            if (d + 1 < dev_count && seg_bytes + b > dev_free[d] && current_slot > start_s) {
+                break;
+            }
+            seg_bytes += b;
+            ++current_slot;
+        }
+        if (seg_bytes == 0) continue;
+
+        cudaSetDevice(d);
+        uint8_t* p = nullptr;
+        if (cudaMalloc((void**) &p, (size_t) seg_bytes) != cudaSuccess) {
+            cudaSetDevice(orig_device);
+            close();
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) on GPU %d failed: %s",
+                          (double) seg_bytes / 1073741824.0, d, cudaGetErrorString(cudaGetLastError()));
+            err = buf;
+            return false;
+        }
+        if (cudaMemset(p, 0, (size_t) seg_bytes) != cudaSuccess) {
+            cudaSetDevice(orig_device);
+            close();
+            err = "ExpertCache: cudaMemset failed on GPU " + std::to_string(d);
+            return false;
+        }
+
+        CacheSegment seg;
+        seg.base = p;
+        seg.ordinal = d;
+        seg.start_slot = (int64_t) start_s;
+        seg.n_slots = (int64_t) (current_slot - start_s);
+        seg.bytes = seg_bytes;
+        segments_.push_back(seg);
+    }
+    cudaSetDevice(orig_device);
+
+    if (segments_.empty()) {
+        err = "ExpertCache: no segments allocated";
         return false;
     }
-    CacheSegment seg;
-    seg.base = base_;
-    seg.ordinal = 0;
-    seg.start_slot = 0;
-    seg.n_slots = (int64_t) slot_bytes.size();
-    seg.bytes = total_want;
-    segments_.push_back(seg);
+    base_ = segments_[0].base;
 
     residency_.assign((size_t) (n_layers * n_expert), kNotResident);
     slots_ = (int64_t) slot_bytes.size();
