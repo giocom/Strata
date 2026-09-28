@@ -1244,6 +1244,14 @@ def main() -> int:
                  f"Close it, or start this one with a different --port")
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
+    elif cfg.get("args") and "--pack" in cfg["args"]:
+        try:
+            pack_idx = cfg["args"].index("--pack")
+            cand = Path(cfg["args"][pack_idx + 1]) / "tokenizer"
+            if cand.exists():
+                a.tokenizer = str(cand)
+        except Exception:
+            pass
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
