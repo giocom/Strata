@@ -81,123 +81,41 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         return false;
     }
 
-    int dev_count = 1;
-    cudaGetDeviceCount(&dev_count);
-    int orig_device = 0;
-    cudaGetDevice(&orig_device);
-
-    const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
-
-    if (dev_count > 1) {
-        // Enable P2P access among all devices
-        for (int i = 0; i < dev_count; ++i) {
-            cudaSetDevice(i);
-            for (int j = 0; j < dev_count; ++j) {
-                if (i != j) {
-                    int can_access = 0;
-                    cudaDeviceCanAccessPeer(&can_access, i, j);
-                    if (can_access) {
-                        cudaDeviceEnablePeerAccess(j, 0);
-                        cudaGetLastError(); // clear status if already enabled
-                    }
-                }
-            }
-        }
-        cudaSetDevice(orig_device);
-
-        std::vector<size_t> free_bytes(dev_count), total_bytes(dev_count);
-        size_t total_free_all = 0;
-        for (int d = 0; d < dev_count; ++d) {
-            cudaSetDevice(d);
-            cudaMemGetInfo(&free_bytes[d], &total_bytes[d]);
-            total_free_all += free_bytes[d];
-        }
-        cudaSetDevice(orig_device);
-
-        if (total_free_all < want) {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+        if ((uint64_t) free_b < want) {
             char buf[320];
             std::snprintf(buf, sizeof buf,
-                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of total VRAM is free across %d GPUs.",
+                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
+                          "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
                           (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
-                          (double) total_free_all / 1073741824.0, dev_count);
+                          (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
+                          (double) total_b / 1073741824.0);
             err = buf;
             return false;
         }
-
-        int64_t remaining_slots = n_slots;
-        int64_t current_start = 0;
-        for (int d = 0; d < dev_count && remaining_slots > 0; ++d) {
-            cudaSetDevice(d);
-            size_t fb = free_bytes[d];
-            size_t usable = fb > (512ull << 20) ? fb - (512ull << 20) : 0;
-            int64_t seg_slots = std::min<int64_t>(remaining_slots, (int64_t)(usable / (uint64_t) blob_bytes));
-            if (d == dev_count - 1 && seg_slots < remaining_slots) {
-                seg_slots = remaining_slots;
-            }
-            if (seg_slots <= 0) continue;
-
-            uint64_t seg_bytes = (uint64_t) seg_slots * (uint64_t) blob_bytes;
-            void* seg_base = nullptr;
-            if (cudaMalloc(&seg_base, (size_t) seg_bytes) != cudaSuccess) {
-                cudaSetDevice(orig_device);
-                close();
-                err = "ExpertCache: cudaMalloc failed on GPU " + std::to_string(d);
-                return false;
-            }
-            cudaMemset(seg_base, 0, (size_t) seg_bytes);
-
-            CacheSegment seg;
-            seg.base = (uint8_t*) seg_base;
-            seg.ordinal = d;
-            seg.start_slot = current_start;
-            seg.n_slots = seg_slots;
-            seg.bytes = seg_bytes;
-            segments_.push_back(seg);
-
-            current_start += seg_slots;
-            remaining_slots -= seg_slots;
-        }
-        cudaSetDevice(orig_device);
-        if (!segments_.empty()) {
-            base_ = segments_[0].base;
-        }
-    } else {
-        size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-            if ((uint64_t) free_b < want) {
-                char buf[320];
-                std::snprintf(buf, sizeof buf,
-                              "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
-                              "(%.2f GiB of %.2f GiB total). Lower --expert-cache.",
-                              (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
-                              (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
-                              (double) total_b / 1073741824.0);
-                err = buf;
-                return false;
-            }
-        }
-
-        if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
-            base_ = nullptr;
-            char buf[256];
-            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
-                          (double) want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
-            err = buf;
-            return false;
-        }
-        if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
-            err = "ExpertCache: cudaMemset of the slot arena failed";
-            close();
-            return false;
-        }
-        CacheSegment seg;
-        seg.base = base_;
-        seg.ordinal = 0;
-        seg.start_slot = 0;
-        seg.n_slots = n_slots;
-        seg.bytes = want;
-        segments_.push_back(seg);
     }
+
+    if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
+        base_ = nullptr;
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
+                      (double) want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
+        err = buf;
+        return false;
+    }
+    if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
+        err = "ExpertCache: cudaMemset of the slot arena failed";
+        close();
+        return false;
+    }
+    CacheSegment seg;
+    seg.base = base_;
+    seg.ordinal = 0;
+    seg.start_slot = 0;
+    seg.n_slots = n_slots;
+    seg.bytes = want;
+    segments_.push_back(seg);
 
     residency_.assign((size_t) (n_layers * n_expert), kNotResident);
     slots_ = n_slots;
@@ -238,113 +156,37 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     }
     const uint64_t total_want = off.back();
 
-    if (dev_count > 1) {
-        for (int i = 0; i < dev_count; ++i) {
-            cudaSetDevice(i);
-            for (int j = 0; j < dev_count; ++j) {
-                if (i != j) {
-                    int can_access = 0;
-                    cudaDeviceCanAccessPeer(&can_access, i, j);
-                    if (can_access) {
-                        cudaDeviceEnablePeerAccess(j, 0);
-                        cudaGetLastError();
-                    }
-                }
-            }
-        }
-        cudaSetDevice(orig_device);
-
-        std::vector<size_t> free_bytes(dev_count), total_bytes(dev_count);
-        size_t total_free_all = 0;
-        for (int d = 0; d < dev_count; ++d) {
-            cudaSetDevice(d);
-            cudaMemGetInfo(&free_bytes[d], &total_bytes[d]);
-            total_free_all += free_bytes[d];
-        }
-        cudaSetDevice(orig_device);
-
-        if (total_free_all < total_want) {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+        if ((uint64_t) free_b < total_want) {
             char buf[320];
             std::snprintf(buf, sizeof buf,
-                          "ExpertCache: %zu sized slots = %.2f GiB, but only %.2f GiB of total VRAM is free across %d GPUs.",
-                          slot_bytes.size(), (double) total_want / 1073741824.0,
-                          (double) total_free_all / 1073741824.0, dev_count);
+                          "ExpertCache: %zu sized slots = %.2f GiB, but only %.2f GiB of VRAM is free.",
+                          slot_bytes.size(), (double) total_want / 1073741824.0, (double) free_b / 1073741824.0);
             err = buf;
             return false;
         }
-
-        size_t slot_idx = 0;
-        for (int d = 0; d < dev_count && slot_idx < slot_bytes.size(); ++d) {
-            cudaSetDevice(d);
-            size_t fb = free_bytes[d];
-            size_t usable = fb > (512ull << 20) ? fb - (512ull << 20) : 0;
-            size_t seg_start = slot_idx;
-            uint64_t seg_bytes = 0;
-            while (slot_idx < slot_bytes.size()) {
-                uint64_t sz = ((uint64_t) slot_bytes[slot_idx] + 255) / 256 * 256;
-                if (d < dev_count - 1 && seg_bytes + sz > usable && slot_idx > seg_start) {
-                    break;
-                }
-                seg_bytes += sz;
-                ++slot_idx;
-            }
-            int64_t seg_slots = (int64_t) (slot_idx - seg_start);
-            if (seg_slots <= 0) continue;
-
-            void* seg_base = nullptr;
-            if (cudaMalloc(&seg_base, (size_t) seg_bytes) != cudaSuccess) {
-                cudaSetDevice(orig_device);
-                close();
-                err = "ExpertCache: cudaMalloc failed on GPU " + std::to_string(d);
-                return false;
-            }
-            cudaMemset(seg_base, 0, (size_t) seg_bytes);
-
-            CacheSegment seg;
-            seg.base = (uint8_t*) seg_base;
-            seg.ordinal = d;
-            seg.start_slot = (int64_t) seg_start;
-            seg.n_slots = seg_slots;
-            seg.bytes = seg_bytes;
-            segments_.push_back(seg);
-        }
-        cudaSetDevice(orig_device);
-        if (!segments_.empty()) {
-            base_ = segments_[0].base;
-        }
-    } else {
-        size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-            if ((uint64_t) free_b < total_want) {
-                char buf[320];
-                std::snprintf(buf, sizeof buf,
-                              "ExpertCache: %zu sized slots = %.2f GiB, but only %.2f GiB of VRAM is free.",
-                              slot_bytes.size(), (double) total_want / 1073741824.0, (double) free_b / 1073741824.0);
-                err = buf;
-                return false;
-            }
-        }
-        if (cudaMalloc((void**) &base_, (size_t) total_want) != cudaSuccess) {
-            base_ = nullptr;
-            char buf[256];
-            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
-                          (double) total_want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
-            err = buf;
-            return false;
-        }
-        if (cudaMemset(base_, 0, (size_t) total_want) != cudaSuccess) {
-            err = "ExpertCache: cudaMemset of the slot arena failed";
-            close();
-            return false;
-        }
-        CacheSegment seg;
-        seg.base = base_;
-        seg.ordinal = 0;
-        seg.start_slot = 0;
-        seg.n_slots = (int64_t) slot_bytes.size();
-        seg.bytes = total_want;
-        segments_.push_back(seg);
     }
+    if (cudaMalloc((void**) &base_, (size_t) total_want) != cudaSuccess) {
+        base_ = nullptr;
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
+                      (double) total_want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
+        err = buf;
+        return false;
+    }
+    if (cudaMemset(base_, 0, (size_t) total_want) != cudaSuccess) {
+        err = "ExpertCache: cudaMemset of the slot arena failed";
+        close();
+        return false;
+    }
+    CacheSegment seg;
+    seg.base = base_;
+    seg.ordinal = 0;
+    seg.start_slot = 0;
+    seg.n_slots = (int64_t) slot_bytes.size();
+    seg.bytes = total_want;
+    segments_.push_back(seg);
 
     residency_.assign((size_t) (n_layers * n_expert), kNotResident);
     slots_ = (int64_t) slot_bytes.size();

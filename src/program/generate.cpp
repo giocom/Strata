@@ -1330,53 +1330,30 @@ int main(int argc, char** argv) {
     }
     const bool auto_cache = o.expert_cache < 0;
     if (o.expert_cache < 0) {
-        int dev_count = 1;
-        cudaGetDeviceCount(&dev_count);
-        size_t total_free_b = 0, total_all_b = 0;
-        for (int d = 0; d < dev_count; ++d) {
-            cudaSetDevice(d);
-            size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
-            total_free_b += fb;
-            total_all_b += tb;
-        }
-        cudaSetDevice(0);
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
         // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib * dev_count + prefill_mib) << 20;
-        int64_t slots = ((int64_t) total_free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
+        int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        if (dev_count > 1) {
-            std::fprintf(stderr, "strata generate: multi-GPU expert cache auto (%d GPUs): %.2f GiB total free, %d MiB/GPU reserved -> %d slots\n",
-                         dev_count, (double) total_free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
-        } else {
-            std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
-                         (double) total_free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
-        }
+        std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
+                     (double) free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
     std::vector<int64_t> sized_slots;
     if (native_pack && o.expert_cache > 0 && !profile.empty()) {
-        int dev_count = 1;
-        cudaGetDeviceCount(&dev_count);
-        size_t total_free_b = 0;
-        for (int d = 0; d < dev_count; ++d) {
-            cudaSetDevice(d);
-            size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
-            total_free_b += fb;
-        }
-        cudaSetDevice(0);
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
         const auto& lay = strata::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
-        size_t total_reserve = ((size_t) o.vram_reserve_mib * dev_count) << 20;
-        size_t free_room = total_free_b > total_reserve ? total_free_b - total_reserve : 0;
+        size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         for (const auto& pr : profile) {
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
