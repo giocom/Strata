@@ -231,12 +231,29 @@ def _cpuid_avx512_full() -> bool:
         return False
 
 
-def gpu_info():
+def all_gpus_info():
     s = out(["nvidia-smi", "--query-gpu=name,memory.total,compute_cap,driver_version", "--format=csv,noheader,nounits"])
     if not s.strip():
+        return []
+    gpus = []
+    for line in s.strip().splitlines():
+        if not line.strip():
+            continue
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) >= 4:
+            gpus.append({"name": parts[0], "vram_gb": float(parts[1]) / 1024.0, "arch": parts[2].replace(".", ""), "driver": parts[3]})
+    return gpus
+
+
+def gpu_info():
+    gpus = all_gpus_info()
+    if not gpus:
         return None
-    name, mem, cc, drv = [x.strip() for x in s.strip().splitlines()[0].split(",")]
-    return {"name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""), "driver": drv}
+    primary = dict(gpus[0])
+    primary["count"] = len(gpus)
+    primary["all_gpus"] = gpus
+    primary["total_vram_gb"] = sum(g["vram_gb"] for g in gpus)
+    return primary
 
 
 def find_nvcc():
@@ -734,14 +751,19 @@ def main() -> int:
     if gpu is None:
         fail("no NVIDIA GPU found (nvidia-smi did not answer)",
              "install the NVIDIA driver from https://www.nvidia.com/drivers and restart the PC")
-    ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {gpu['arch'][:-1]}.{gpu['arch'][-1]}, "
-       f"driver {gpu['driver']}")
+    if gpu.get("count", 1) > 1:
+        ok(f"GPUs detected: {gpu['count']}x NVIDIA GPUs (Total VRAM: {gpu['total_vram_gb']:.1f} GB)")
+        for idx, g in enumerate(gpu.get("all_gpus", [])):
+            ok(f"  [GPU {idx}] {g['name']}, {g['vram_gb']:.1f} GB VRAM, CC {g['arch'][:-1]}.{g['arch'][-1]}")
+    else:
+        ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {gpu['arch'][:-1]}.{gpu['arch'][-1]}, "
+           f"driver {gpu['driver']}")
     if int(gpu["arch"]) < 80:
         fail("this GPU is older than the RTX 30 series (compute capability 8.0 is required)")
     if driver_major(gpu) < MIN_DRIVER:
         fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
              "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
-    if gpu["vram_gb"] < 11:
+    if gpu.get("total_vram_gb", gpu["vram_gb"]) < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
     cpu, avx2, avx512 = cpu_info()
