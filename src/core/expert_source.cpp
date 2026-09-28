@@ -304,19 +304,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int kd = -1;
             unsigned long long ptr = 0;
             if (e >= 0 && e < d.n_expert) {
-                const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
-                if (slot >= 0) {
+                const int32_t slot = d.host_res ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] : -1;
+                const bool in_gpu0 = (slot >= 0) && (d.cache == nullptr || d.cache->slot_device(slot) == 0);
+                if (in_gpu0) {
                     kd = 0;
-                    if (d.cache != nullptr) {
-                        ptr = (unsigned long long) d.cache->device_slot(slot);
-                    } else {
-                        ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
-                                                                                     : (size_t) slot * (size_t) d.cache_blob));
-                    }
+                    ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
+                                                                                 : (size_t) slot * (size_t) d.cache_blob));
                 } else {
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
-                        const uint8_t* src = d.src->blob(d.layers, e);
-                        if (src != nullptr && d.src->pinned(d.layers, e)) {
+                    if (fetches < P.staging_cap && fetches < 64) {
+                        const uint8_t* src = (slot >= 0 && d.cache != nullptr) ? d.cache->device_slot(slot)
+                                                                                : d.src->blob(d.layers, e);
+                        if (src != nullptr) {
                             kd = 1;
                             dma_src[fetches] = src;
                             pcie_i0[fetches] = i0;
